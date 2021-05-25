@@ -7,7 +7,7 @@ import torchvision
 import numpy as np
 import matplotlib.pyplot as plt
 
-THRESHOLD = 0.7
+THRESHOLD = 0.8
 
 transform_img = transforms.Compose([
 transforms.ToTensor(),
@@ -28,7 +28,7 @@ def get_model_instance_segmentation(num_classes):
 def get_model():
 	net = get_model_instance_segmentation(2)
 	net.eval()
-	net.load_state_dict(torch.load('model.pth'), strict=False)
+	net.load_state_dict(torch.load('model.pth', map_location='cpu'), strict=False)
 	return net
 
 def load_img(path):
@@ -62,7 +62,7 @@ def predict(imgs, imgs_t, net, save_image=False, threshold=THRESHOLD):
 
 def main():
 	net = get_model()
-	img, img_t = load_img(path='test/5.png')
+	img, img_t = load_img(path='test/1.jpg')
 	preds = predict([img], img_t, net, save_image=True)
 
 if __name__ == '__main__':
