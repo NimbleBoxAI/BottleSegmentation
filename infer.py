@@ -31,10 +31,13 @@ def get_model():
 	net.load_state_dict(torch.load('model.pth'), strict=False)
 	return net
 
-def predict(net, save_image=False, threshold=THRESHOLD):
-	img = Image.open('test/5.png').convert('RGB')
+def load_img(path):
+	img = Image.open(path).convert('RGB')
 	img_t = transform_img(img).unsqueeze(0)
-	outputs = net(img_t)
+	return img, img_t
+
+def predict(imgs, imgs_t, net, save_image=False, threshold=THRESHOLD):
+	outputs = net(imgs_t)
 	predictions = []
 	for i in range(len(outputs)):
 		pred_proba = outputs[i]['scores'].detach().numpy()
@@ -46,7 +49,7 @@ def predict(net, save_image=False, threshold=THRESHOLD):
 			mask = np.round(mask).astype(int)
 			coords = outputs[i]['boxes'][j]
 			coords = np.array(coords.detach(), dtype=np.int32)
-			img_c = np.array(img)
+			img_c = np.array(imgs[i])
 			img_c = img_c[coords[1]:coords[3],coords[0]:coords[2],:]
 			mask = mask[coords[1]:coords[3],coords[0]:coords[2]]
 			mask = np.expand_dims(mask, axis=2)
@@ -59,7 +62,8 @@ def predict(net, save_image=False, threshold=THRESHOLD):
 
 def main():
 	net = get_model()
-	preds = predict(net, save_image=True)
+	img, img_t = load_img(path='test/5.png')
+	preds = predict([img], img_t, net, save_image=True)
 
 if __name__ == '__main__':
 	main()
