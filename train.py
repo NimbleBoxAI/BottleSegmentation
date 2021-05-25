@@ -2,26 +2,32 @@ from pycocotools.coco import COCO
 import numpy as np
 import random
 import os
-import cv2
 from PIL import Image
 import matplotlib.pyplot as plt
-from skimage.transform import resize
-import segmentation_models_pytorch as smp
+from torchvision import transforms 
 from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-from torchvision import datasets, models, transforms
+import torchvision
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+import utils
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from engine import train_one_epoch, evaluate
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
-class SegmentationNet(nn.Module):
-	def __init__(self):
-		super(SegmentationNet, self).__init__()
-		self.segnet = smp.DeepLabV3Plus(encoder_name="efficientnet-b1", encoder_weights="imagenet", in_channels=3, classes=1)
-	def forward(self, x):
-		x = self.segnet(x)
-		return x
+def get_model_instance_segmentation(num_classes):
+	model = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=True)
+	in_features = model.roi_heads.box_predictor.cls_score.in_features
+	model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+	in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+	hidden_layer = 256
+	model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask,
+													   hidden_layer,
+													   num_classes)
+	return model
 
 class Dataset(torch.utils.data.Dataset):
 	'Characterizes a dataset for PyTorch'
@@ -30,11 +36,8 @@ class Dataset(torch.utils.data.Dataset):
 		self.img_id = img_id
 		self.coco = coco
 		self.transform_img = transforms.Compose([
-			transforms.Resize((240,240)),
-			#transforms.CenterCrop(528),
-			transforms.ColorJitter(hue=.05, saturation=.05),
-			transforms.ToTensor(),
-			transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+		transforms.ToTensor(),
+		transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 		])
 
 	def __len__(self):
@@ -49,59 +52,62 @@ class Dataset(torch.utils.data.Dataset):
 		img_file = img['file_name']
 		image = Image.open(f'coco/train2017/{img_file}').convert('RGB')
 		image = self.transform_img(image)
-		mask = np.zeros((img['height'],img['width']))
+		masks = []
 		for i in range(len(anns)):
+			mask = np.zeros((img['height'],img['width']))
 			mask = np.maximum(self.coco.annToMask(anns[i]), mask)
-		mask = torch.tensor(resize(mask, (240,240)), dtype=torch.float).unsqueeze(0)
-		return image, mask
+			masks.append(mask)
+		masks = torch.as_tensor(masks, dtype=torch.uint8)
+		boxes = []
+		for i in range(len(anns)):
+			pos = anns[i]['bbox']
+			xmin = pos[0]
+			xmax = xmin+pos[2]
+			ymin = pos[1]
+			ymax = ymin+pos[3]
+			boxes.append([xmin, ymin, xmax, ymax])
+		boxes = torch.as_tensor(boxes, dtype=torch.float32)
+		labels = torch.ones((len(anns),), dtype=torch.int64)
+		target = {}
+		target["boxes"] = boxes
+		target["labels"] = labels
+		target["masks"] = masks
+		return image, target
+
 
 def main():
+	device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+	num_classes = 2
 	annFile='coco/annotations_trainval2017/annotations/instances_train2017.json'
 	coco=COCO(annFile)
 	catIDs = coco.getCatIds()
 	cats = coco.loadCats(catIDs)
 	img_Ids = coco.getImgIds(catIds=44)
-
-	train_imgIds, val_imgIds = train_test_split(img_Ids, test_size=0.15)
+	train_imgIds, val_imgIds = train_test_split(img_Ids, test_size=0.1)
 	train_dataset = Dataset(train_imgIds, coco)
-	val_dataset = Dataset(val_imgIds, coco)
-	train_loader = DataLoader(train_dataset, batch_size=6, num_workers=os.cpu_count(), drop_last = True)
-	val_loader = DataLoader(val_dataset, batch_size=6, num_workers=os.cpu_count(), drop_last = True)
-	net = SegmentationNet().cuda()
-	EPOCHS = 10
-	criterion = nn.MSELoss()
-	optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+	test_dataset = Dataset(val_imgIds, coco)
+	data_loader = DataLoader(train_dataset, batch_size=4, num_workers=os.cpu_count(),
+		collate_fn=utils.collate_fn)
+	data_loader_test = DataLoader(test_dataset, batch_size=1, num_workers=os.cpu_count(),
+		collate_fn=utils.collate_fn)
 
-	best_loss = 1e8
-	for i in range(EPOCHS):
-		total_loss = 0
-		
-		net.train()
-		print("***Train***")
-		for image, mask in tqdm(train_loader):
-			output_mask = net(image.cuda())
-			loss = criterion(output_mask, mask.cuda())
-			total_loss += loss
-			optimizer.zero_grad()
-			loss.backward()
-			optimizer.step()
-		print(i, total_loss.item())
+	model = get_model_instance_segmentation(num_classes)
 
-		net.eval()
-		total_loss = 0
-		print("***Validation***")
-		with torch.no_grad():
-			for image, mask in val_loader:
-				output_mask = net(image.cuda())
-				loss = criterion(output_mask, mask.cuda())
-				total_loss += loss
-		val_loss = total_loss.item()
-		print(val_loss)
-		if val_loss<best_loss:
-			best_loss = val_loss
-			torch.save(net.state_dict(),"model_best.pth")
-		else:
-			torch.save(net.state_dict(),"model_last.pth")
+	model.to(device)
+
+	params = [p for p in model.parameters() if p.requires_grad]
+	optimizer = torch.optim.SGD(params, lr=0.005,
+								momentum=0.9, weight_decay=0.0005)
+	lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
+												   step_size=3,
+												   gamma=0.1)
+	num_epochs = 10
+
+	for epoch in range(num_epochs):
+		train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
+		lr_scheduler.step()
+		torch.save(model.state_dict(),"model.pth")
+		#evaluate(model, data_loader_test, device, epoch)
 
 if __name__ == '__main__':
 	main()
